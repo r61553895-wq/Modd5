@@ -37,6 +37,21 @@ jobs:
           fi
           echo "PROJECT_DIR=$(dirname "$GRADLE_FILE")" >> "$GITHUB_ENV"
 
+      - name: Patch drag-and-drop method
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          p = glob.glob("_src/**/ImageBuilderScreen.java", recursive=True)[0]
+          s = open(p, encoding="utf-8").read()
+          old = "\t@Override\n\tpublic void filesDragged(List<Path> paths) {\n\t\tfor (Path p : paths) {"
+          new = "\tpublic void onFilesDropped(List<Path> paths) {\n\t\thandleDroppedFiles(paths);\n\t}\n\n\tpublic void filesDragged(List<Path> paths) {\n\t\thandleDroppedFiles(paths);\n\t}\n\n\tprivate void handleDroppedFiles(List<Path> paths) {\n\t\tfor (Path p : paths) {"
+          if old in s:
+              open(p, "w", encoding="utf-8").write(s.replace(old, new))
+              print("patched")
+          else:
+              print("already fixed or not found")
+          PYEOF
+
       - name: Build
         run: |
           cd "$PROJECT_DIR"
