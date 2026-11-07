@@ -37,20 +37,450 @@ jobs:
           fi
           echo "PROJECT_DIR=$(dirname "$GRADLE_FILE")" >> "$GITHUB_ENV"
 
-      - name: Patch drag-and-drop method
+      - name: Overwrite client sources with updated versions
         run: |
-          python3 - <<'PYEOF'
-          import glob
-          p = glob.glob("_src/**/ImageBuilderScreen.java", recursive=True)[0]
-          s = open(p, encoding="utf-8").read()
-          old = "\t@Override\n\tpublic void filesDragged(List<Path> paths) {\n\t\tfor (Path p : paths) {"
-          new = "\tpublic void onFilesDropped(List<Path> paths) {\n\t\thandleDroppedFiles(paths);\n\t}\n\n\tpublic void filesDragged(List<Path> paths) {\n\t\thandleDroppedFiles(paths);\n\t}\n\n\tprivate void handleDroppedFiles(List<Path> paths) {\n\t\tfor (Path p : paths) {"
-          if old in s:
-              open(p, "w", encoding="utf-8").write(s.replace(old, new))
-              print("patched")
-          else:
-              print("already fixed or not found")
-          PYEOF
+          DIR="$PROJECT_DIR/src/main/java/com/imagebuilder/client"
+          mkdir -p "$DIR"
+          cat > "$DIR/ImageBuilderScreen.java" <<'JAVA_EOF'
+          package com.imagebuilder.client;
+
+          import com.imagebuilder.ImageBuilderMod;
+          import com.imagebuilder.ImageProcessor;
+          import com.imagebuilder.Palette;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.SliderWidget;
+          import net.minecraft.text.Text;
+          import org.lwjgl.PointerBuffer;
+          import org.lwjgl.system.MemoryStack;
+          import org.lwjgl.util.tinyfd.TinyFileDialogs;
+
+          import java.awt.image.BufferedImage;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.StandardCopyOption;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.concurrent.CompletableFuture;
+          import java.util.concurrent.CompletionException;
+          import java.util.stream.Stream;
+
+          /** Меню: выбери картинку из папки (или перетащи в окно на ПК), настрой и нажми «Построить». */
+          public class ImageBuilderScreen extends Screen {
+              private static final Set<String> EXT = Set.of("png", "jpg", "jpeg", "gif", "bmp");
+              private static final int PANEL_X = 10;
+              private static final int PANEL_W = 150;
+
+              // Настройки помним между открытиями меню
+              private static int blocksWidth = 64;
+              private static int paletteIdx = 0;
+              private static boolean dither = true;
+              private static boolean floor = false;
+
+              private BufferedImage image;
+              private Path source;
+              private volatile ImageProcessor.Result result;
+              private volatile Palette resultPalette;
+              private int version = 0;
+              private String status = "";
+
+              private final List<Path> folderFiles = new ArrayList<>();
+              private int folderIdx = -1;
+
+              private ButtonWidget folderBtn;
+              private ButtonWidget paletteBtn;
+              private ButtonWidget ditherBtn;
+              private ButtonWidget modeBtn;
+              private ButtonWidget buildBtn;
+
+              public ImageBuilderScreen() {
+                  super(Text.literal("Image Builder"));
+              }
+
+              @Override
+              protected void init() {
+                  scanFolder();
+                  int x = PANEL_X;
+                  int y = 30;
+
+                  folderBtn = addDrawableChild(ButtonWidget.builder(Text.empty(), b -> cycleFolder())
+                          .dimensions(x, y, PANEL_W, 20).build());
+                  y += 22;
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Выбрать файл (ПК)..."), b -> chooseFile())
+                          .dimensions(x, y, PANEL_W, 20).build());
+                  y += 22;
+
+                  addDrawableChild(new WidthSlider(x, y, PANEL_W, 20));
+                  y += 22;
+
+                  paletteBtn = addDrawableChild(ButtonWidget.builder(Text.empty(), b -> {
+                      paletteIdx = (paletteIdx + 1) % Palette.NAMES.length;
+                      refreshLabels();
+                      requestConvert();
+                  }).dimensions(x, y, PANEL_W, 20).build());
+                  y += 22;
+
+                  ditherBtn = addDrawableChild(ButtonWidget.builder(Text.empty(), b -> {
+                      dither = !dither;
+                      refreshLabels();
+                      requestConvert();
+                  }).dimensions(x, y, PANEL_W, 20).build());
+                  y += 22;
+
+                  modeBtn = addDrawableChild(ButtonWidget.builder(Text.empty(), b -> {
+                      floor = !floor;
+                      refreshLabels();
+                  }).dimensions(x, y, PANEL_W, 20).build());
+                  y += 26;
+
+                  buildBtn = addDrawableChild(ButtonWidget.builder(Text.literal("Построить"), b -> build())
+                          .dimensions(x, y, PANEL_W, 20).build());
+                  y += 22;
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Отменить стройку"), b -> undo())
+                          .dimensions(x, y, PANEL_W, 20).build());
+                  y += 22;
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Закрыть"), b -> close())
+                          .dimensions(x, y, PANEL_W, 20).build());
+
+                  refreshLabels();
+              }
+
+              private void refreshLabels() {
+                  if (folderFiles.isEmpty() || folderIdx < 0 || folderIdx >= folderFiles.size()) {
+                      folderBtn.setMessage(Text.literal("Файл из папки"));
+                  } else {
+                      String name = textRenderer.trimToWidth(folderFiles.get(folderIdx).getFileName().toString(), 95);
+                      folderBtn.setMessage(Text.literal(name + " (" + (folderIdx + 1) + "/" + folderFiles.size() + ")"));
+                  }
+                  paletteBtn.setMessage(Text.literal("Палитра: " + Palette.NAMES[paletteIdx]));
+                  ditherBtn.setMessage(Text.literal("Дизеринг: " + (dither ? "вкл" : "выкл")));
+                  modeBtn.setMessage(Text.literal("Режим: " + (floor ? "на земле" : "стена")));
+              }
+
+              // ---------- файлы ----------
+
+              // Имя метода в Yarn менялось между версиями, поэтому объявлены оба варианта (без @Override):
+              // вызовется тот, который соответствует мэппингам 1.21.4, второй просто остаётся неиспользованным.
+              public void onFilesDropped(List<Path> paths) {
+                  handleDroppedFiles(paths);
+              }
+
+              public void filesDragged(List<Path> paths) {
+                  handleDroppedFiles(paths);
+              }
+
+              private void handleDroppedFiles(List<Path> paths) {
+                  for (Path p : paths) {
+                      if (isImage(p)) {
+                          loadImage(p);
+                          return;
+                      }
+                  }
+                  status = "Нужен файл PNG, JPG, GIF или BMP";
+              }
+
+              private void scanFolder() {
+                  folderFiles.clear();
+                  Path dir = ImageBuilderMod.imagesDir();
+                  try {
+                      Files.createDirectories(dir);
+                  } catch (IOException ignored) {
+                      // папку покажем в подсказке, ошибка тут не критична
+                  }
+                  try (Stream<Path> s = Files.list(dir)) {
+                      s.filter(Files::isRegularFile)
+                              .filter(ImageBuilderScreen::isImage)
+                              .sorted()
+                              .forEach(folderFiles::add);
+                  } catch (IOException e) {
+                      ImageBuilderMod.LOGGER.warn("Не удалось прочитать папку {}", dir, e);
+                  }
+              }
+
+              /** Каждое нажатие заново читает папку и загружает следующую картинку по кругу. */
+              private void cycleFolder() {
+                  scanFolder();
+                  if (folderFiles.isEmpty()) {
+                      folderIdx = -1;
+                      status = "В папке нет картинок";
+                      refreshLabels();
+                      return;
+                  }
+                  folderIdx = (folderIdx + 1) % folderFiles.size();
+                  refreshLabels();
+                  loadImage(folderFiles.get(folderIdx));
+              }
+
+              private void chooseFile() {
+                  String picked = null;
+                  try (MemoryStack stack = MemoryStack.stackPush()) {
+                      PointerBuffer filters = stack.mallocPointer(5);
+                      for (String f : new String[]{"*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp"}) {
+                          filters.put(stack.UTF8(f));
+                      }
+                      filters.flip();
+                      picked = TinyFileDialogs.tinyfd_openFileDialog(
+                              "Select image", null, filters, "Images (png, jpg, gif, bmp)", false);
+                  } catch (Throwable t) {
+                      ImageBuilderMod.LOGGER.warn("Не удалось открыть окно выбора файла", t);
+                  }
+                  if (picked != null && !picked.isEmpty()) {
+                      loadImage(Path.of(picked));
+                  } else {
+                      status = "Окно выбора не сработало? Используй «Файл из папки».";
+                  }
+              }
+
+              private static boolean isImage(Path p) {
+                  String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                  int dot = n.lastIndexOf('.');
+                  return dot >= 0 && EXT.contains(n.substring(dot + 1));
+              }
+
+              private void loadImage(Path path) {
+                  if (!isImage(path)) {
+                      status = "Нужен файл PNG, JPG, GIF или BMP";
+                      return;
+                  }
+                  status = "Загружаю...";
+                  CompletableFuture.supplyAsync(() -> {
+                      try (InputStream in = Files.newInputStream(path)) {
+                          return ImageProcessor.read(in);
+                      } catch (IOException e) {
+                          throw new CompletionException(e);
+                      }
+                  }).whenComplete((img, err) -> client.execute(() -> {
+                      if (err != null) {
+                          Throwable cause = err.getCause() != null ? err.getCause() : err;
+                          status = "Ошибка: " + cause;
+                          return;
+                      }
+                      image = img;
+                      source = path;
+                      result = null;
+                      status = path.getFileName().toString();
+                      requestConvert();
+                  }));
+              }
+
+              // ---------- конвертация и предпросмотр ----------
+
+              private void requestConvert() {
+                  if (image == null) return;
+                  final BufferedImage img = image;
+                  final int w = blocksWidth;
+                  final boolean d = dither;
+                  final Palette pal = Palette.get(Palette.NAMES[paletteIdx]);
+                  final int ver = ++version;
+                  CompletableFuture.supplyAsync(() -> ImageProcessor.convert(img, w, pal, d))
+                          .whenComplete((res, err) -> client.execute(() -> {
+                              if (ver != version) return;
+                              if (err != null) {
+                                  status = "Ошибка: " + err;
+                                  return;
+                              }
+                              result = res;
+                              resultPalette = pal;
+                          }));
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  buildBtn.active = result != null;
+                  super.render(ctx, mouseX, mouseY, delta);
+
+                  ctx.drawTextWithShadow(textRenderer, Text.literal("Image Builder"), PANEL_X, 12, 0xFFFFFFFF);
+                  drawPreview(ctx);
+
+                  ImageProcessor.Result r = result;
+                  String info = status;
+                  if (r != null) {
+                      info = status + "  |  " + r.width() + "x" + r.height() + " блоков";
+                  }
+                  ctx.drawCenteredTextWithShadow(textRenderer, Text.literal(info), this.width / 2, this.height - 28, 0xFFFFFFFF);
+                  ctx.drawCenteredTextWithShadow(textRenderer,
+                          Text.literal("Для стройки нужны читы."),
+                          this.width / 2, this.height - 16, 0xFFAAAAAA);
+              }
+
+              private static List<String> wrap(String s, int max) {
+                  List<String> out = new ArrayList<>();
+                  for (int i = 0; i < s.length(); i += max) {
+                      out.add(s.substring(i, Math.min(s.length(), i + max)));
+                  }
+                  return out;
+              }
+
+              private void drawPreview(DrawContext ctx) {
+                  int ax = PANEL_X + PANEL_W + 12;
+                  int ay = 30;
+                  int aw = this.width - ax - 10;
+                  int ah = this.height - ay - 36;
+                  if (aw < 20 || ah < 20) return;
+
+                  ctx.fill(ax, ay, ax + aw, ay + ah, 0x80000000);
+
+                  ImageProcessor.Result r = result;
+                  Palette p = resultPalette;
+                  if (r == null || p == null) {
+                      if (image != null) {
+                          ctx.drawCenteredTextWithShadow(textRenderer, Text.literal("Обрабатываю..."),
+                                  ax + aw / 2, ay + ah / 2, 0xFFFFFFFF);
+                          return;
+                      }
+                      int tx = ax + 6;
+                      int ty = ay + 8;
+                      ctx.drawTextWithShadow(textRenderer, Text.literal("1. Положи PNG/JPG в папку:"), tx, ty, 0xFFFFFFFF);
+                      ty += 12;
+                      int max = Math.max(10, (aw - 12) / 6);
+                      for (String line : wrap(ImageBuilderMod.imagesDir().toString(), max)) {
+                          ctx.drawTextWithShadow(textRenderer, Text.literal(line), tx, ty, 0xFFFFFF55);
+                          ty += 11;
+                      }
+                      ty += 4;
+                      ctx.drawTextWithShadow(textRenderer, Text.literal("2. Нажми «Файл из папки» слева."), tx, ty, 0xFFFFFFFF);
+                      ty += 12;
+                      ctx.drawTextWithShadow(textRenderer, Text.literal("(На ПК можно перетащить файл в окно.)"), tx, ty, 0xFFAAAAAA);
+                      return;
+                  }
+
+                  int stride = Math.max(1, (int) Math.ceil(Math.max(r.width(), r.height()) / 128.0));
+                  int cx = (r.width() + stride - 1) / stride;
+                  int cy = (r.height() + stride - 1) / stride;
+                  int cell = Math.max(1, Math.min((aw - 4) / cx, (ah - 4) / cy));
+                  int px = ax + (aw - cx * cell) / 2;
+                  int py = ay + (ah - cy * cell) / 2;
+
+                  int[] idxs = r.indices();
+                  for (int j = 0; j < cy; j++) {
+                      for (int i = 0; i < cx; i++) {
+                          int idx = idxs[(j * stride) * r.width() + i * stride];
+                          if (idx < 0) continue;
+                          int color = 0xFF000000 | (p.pr[idx] << 16) | (p.pg[idx] << 8) | p.pb[idx];
+                          ctx.fill(px + i * cell, py + j * cell, px + (i + 1) * cell, py + (j + 1) * cell, color);
+                      }
+                  }
+              }
+
+              // ---------- действия ----------
+
+              private void build() {
+                  if (result == null || source == null || client == null || client.player == null) return;
+                  try {
+                      String name = stageFile();
+                      client.player.networkHandler.sendChatCommand("imgbuild run " + blocksWidth + " "
+                              + Palette.NAMES[paletteIdx] + " " + dither + " " + (floor ? "floor" : "wall") + " " + name);
+                      close();
+                  } catch (IOException e) {
+                      ImageBuilderMod.LOGGER.warn("Не удалось скопировать файл", e);
+                      status = "Ошибка копирования: " + e.getMessage();
+                  }
+              }
+
+              private void undo() {
+                  if (client == null || client.player == null) return;
+                  client.player.networkHandler.sendChatCommand("imgbuild undo");
+                  close();
+              }
+
+              /** Копирует картинку в папку imagebuilder (с безопасным именем), чтобы серверная часть смогла её прочитать. */
+              private String stageFile() throws IOException {
+                  Path dir = ImageBuilderMod.imagesDir();
+                  Files.createDirectories(dir);
+                  String orig = source.getFileName().toString();
+                  String clean = orig.replaceAll("[^A-Za-z0-9._-]", "_");
+                  if (!clean.equals(orig)) {
+                      // имя было с пробелами/кириллицей: добавляем хеш, чтобы разные файлы не перезаписали друг друга
+                      int dot = clean.lastIndexOf('.');
+                      String base = dot >= 0 ? clean.substring(0, dot) : clean;
+                      String ext = dot >= 0 ? clean.substring(dot) : "";
+                      clean = base + "_" + Integer.toHexString(orig.hashCode()) + ext;
+                  }
+                  Path dst = dir.resolve(clean);
+                  Path src = source.toAbsolutePath().normalize();
+                  if (!src.equals(dst)) {
+                      Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING);
+                  }
+                  return clean;
+              }
+
+              // ---------- ползунок ширины ----------
+
+              private static int toWidth(double v) {
+                  return 8 + (int) Math.round(v * 248);
+              }
+
+              private final class WidthSlider extends SliderWidget {
+                  WidthSlider(int x, int y, int w, int h) {
+                      super(x, y, w, h, Text.empty(), (blocksWidth - 8) / 248.0);
+                      updateMessage();
+                  }
+
+                  @Override
+                  protected void updateMessage() {
+                      setMessage(Text.literal("Ширина: " + toWidth(this.value) + " блоков"));
+                  }
+
+                  @Override
+                  protected void applyValue() {
+                      int nw = toWidth(this.value);
+                      if (nw != blocksWidth) {
+                          blocksWidth = nw;
+                          requestConvert();
+                      }
+                  }
+              }
+          }
+          JAVA_EOF
+          cat > "$DIR/ImageBuilderClient.java" <<'JAVA_EOF'
+          package com.imagebuilder.client;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import org.lwjgl.glfw.GLFW;
+
+          public class ImageBuilderClient implements ClientModInitializer {
+              private static KeyBinding openKey;
+              private static volatile boolean pendingOpen = false;
+
+              @Override
+              public void onInitializeClient() {
+                  openKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.imagebuilder.open", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_B, "category.imagebuilder"));
+
+                  // /imggui — открыть меню командой из чата (удобно на телефоне, где нет клавиши B)
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                          dispatcher.register(ClientCommandManager.literal("imggui").executes(ctx -> {
+                              pendingOpen = true;
+                              return 1;
+                          })));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (openKey.wasPressed()) {
+                          pendingOpen = true;
+                      }
+                      // Открываем на следующем тике, когда чат уже закрылся
+                      if (pendingOpen && client.player != null && client.currentScreen == null) {
+                          pendingOpen = false;
+                          client.setScreen(new ImageBuilderScreen());
+                      }
+                  });
+              }
+          }
+          JAVA_EOF
 
       - name: Build
         run: |
